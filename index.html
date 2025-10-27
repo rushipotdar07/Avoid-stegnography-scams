@@ -1,0 +1,418 @@
+<!-- <!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Stego / Hidden-data Quick Checker</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body {
+            font-family: Inter, system-ui, -apple-system, Roboto, Arial;
+            background: #0b1420;
+            color: #e6f0f6;
+            padding: 20px;
+        }
+
+        .card {
+            background: #081 dig;
+            padding: 16px;
+            border-radius: 10px;
+            background: linear-gradient(180deg, #071023, #071428);
+            box-shadow: 0 6px 20px rgba(2, 8, 20, .6);
+            margin-bottom: 12px;
+        }
+
+        h1 {
+            color: #7bdff6;
+            margin: 0 0 8px;
+        }
+
+        .muted {
+            color: #9fb3c6;
+            font-size: 13px;
+        }
+
+        input[type=file] {
+            display: block;
+            margin: 10px 0 12px;
+        }
+
+        .alert {
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: 700;
+        }
+
+        .red {
+            background: linear-gradient(90deg, #3a0f12, #4b1115);
+            color: #ffdada;
+            border: 1px solid #7a2a2a;
+        }
+
+        .green {
+            background: linear-gradient(90deg, #093218, #0e3f29);
+            color: #c8ffd4;
+            border: 1px solid #1f7a52;
+        }
+
+        .yellow {
+            background: linear-gradient(90deg, #37280a, #4b3610);
+            color: #fff0c6;
+            border: 1px solid #8b6f1f;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+        }
+
+        td,
+        th {
+            padding: 6px 8px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            font-size: 13px;
+        }
+
+        button {
+            background: #7bdff6;
+            color: #062;
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-weight: 700;
+        }
+
+        .small {
+            font-size: 12px;
+            color: #9fb3c6;
+        }
+
+        .code {
+            font-family: monospace;
+            background: rgba(255, 255, 255, 0.02);
+            padding: 6px 8px;
+            border-radius: 6px;
+            display: inline-block;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <h1>Hidden-data Quick Checker</h1>
+        <div class="muted">Choose an image file. This tool checks for appended payloads, detects common embedded file
+            signatures, runs LSB heuristics, and will alert if something suspicious is found.</div>
+        <input id="fileInput" type="file" accept="image/*" />
+        <div id="status" style="margin-top:10px;"></div>
+    </div>
+
+    <div id="report" class="card" style="display:none;"></div>
+
+    <script>
+        /*
+          Client-side stego / appended-data checker.
+          - Detects appended bytes after JPEG EOI or PNG IEND or large tail for other formats.
+          - Scans tail for file signatures and printable ASCII concentration.
+          - Performs LSB heuristics and block-uniformity check.
+          - If appended payload found, allows download of extracted payload blob.
+        */
+
+        const fileInput = document.getElementById('fileInput');
+        const statusEl = document.getElementById('status');
+        const reportEl = document.getElementById('report');
+
+        fileInput.addEventListener('change', async (e) => {
+            const f = e.target.files?.[0];
+            if (!f) return;
+            reportEl.style.display = 'none';
+            statusEl.innerHTML = `<div class="small">Reading file <span class="code">${escapeHtml(f.name)}</span> (${f.size} bytes)...</div>`;
+            const ab = await readArrayBuffer(f);
+            const view = new Uint8Array(ab);
+            const magic = view.slice(0, 8).map(b => b.toString(16).padStart(2, '0')).join(' ');
+            // detect formats
+            const isPNG = view[0] == 0x89 && view[1] == 0x50 && view[2] == 0x4E && view[3] == 0x47;
+            const isJPG = view[0] == 0xFF && view[1] == 0xD8 && view[2] == 0xFF;
+            const isGIF = view[0] == 0x47 && view[1] == 0x49 && view[2] == 0x46;
+            const isBMP = view[0] == 0x42 && view[1] == 0x4D;
+            // find expected EOF index and tail
+            let eofIndex = -1, tailOffset = -1;
+            if (isJPG) {
+                // find EOI 0xFF 0xD9 from start (first occurrence after minimal header) - take last occurrence
+                for (let i = view.length - 2; i >= 0; i--) {
+                    if (view[i] === 0xFF && view[i + 1] === 0xD9) { eofIndex = i + 2; break; }
+                }
+            } else if (isPNG) {
+                // find IEND chunk (last occurence of 'IEND' chunk sequence)
+                // IEND chunk structure: 00 00 00 00 49 45 4E 44 AE 42 60 82 (length=0, chunk type IEND, CRC)
+                for (let i = view.length - 12; i >= 0; i--) {
+                    if (view[i + 4] === 0x49 && view[i + 5] === 0x45 && view[i + 6] === 0x4E && view[i + 7] === 0x44) {
+                        eofIndex = i + 12; // end of IEND chunk
+                        break;
+                    }
+                }
+            } else if (isGIF) {
+                // GIF terminator is 0x3B
+                for (let i = view.length - 1; i >= 0; i--) {
+                    if (view[i] === 0x3B) { eofIndex = i + 1; break; }
+                }
+            } else if (isBMP) {
+                // BMP: file size in header at offset 2 (little endian 4 bytes)
+                if (view.length >= 6) {
+                    const size = view[2] | (view[3] << 8) | (view[4] << 16) | (view[5] << 24);
+                    eofIndex = size <= view.length ? size : -1;
+                }
+            }
+            if (eofIndex === -1) {
+                // Fallback: treat any trailing bytes after the last plausible image data as tail if last 1024 bytes are not typical
+                eofIndex = -1;
+            }
+            // define tail: bytes after eofIndex if found ; otherwise if file contains long 'appended' region (last N bytes > threshold) treat tail from first suspicious spot
+            let tail = new Uint8Array(0);
+            if (eofIndex > 0 && eofIndex < view.length) {
+                tailOffset = eofIndex;
+                tail = view.slice(tailOffset);
+            } else {
+                // heuristic: check for long printable-run near end or presence of other file signatures inside file after some offset
+                // We'll search for common signatures anywhere past 1KB
+                const searchStart = Math.min(1024, Math.floor(view.length / 10));
+                const foundSig = findFirstSignature(view, searchStart);
+                if (foundSig) {
+                    tailOffset = foundSig.pos;
+                    tail = view.slice(tailOffset);
+                } else {
+                    // if file ends with many non-zero bytes but we couldn't parse EOF, consider last 512 bytes as tail candidate if not image-like
+                    const minTail = 512;
+                    if (view.length > minTail) {
+                        const tailCandidate = view.slice(view.length - minTail);
+                        // if proportion of printable in tailCandidate > 0.3 or contains signature then treat as tail
+                        const printableFrac = printableFraction(tailCandidate);
+                        if (printableFrac > 0.3 || findFirstSignature(tailCandidate, 0)) {
+                            tailOffset = view.length - minTail;
+                            tail = tailCandidate;
+                        }
+                    }
+                }
+            }
+
+            // analyze tail
+            const tailInfo = analyzeTail(tail);
+            // Examine LSB stats by drawing image to canvas (downsample if huge)
+            const dataUrl = await readDataURL(f);
+            const img = new Image();
+            img.src = dataUrl;
+            img.onload = async () => {
+                const maxPixels = 2_000_000;
+                let scale = 1;
+                if (img.width * img.height > maxPixels) scale = Math.sqrt(maxPixels / (img.width * img.height));
+                const cw = Math.max(1, Math.floor(img.width * scale));
+                const ch = Math.max(1, Math.floor(img.height * scale));
+                const canvas = document.createElement('canvas');
+                canvas.width = cw; canvas.height = ch;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, cw, ch);
+                const imageData = ctx.getImageData(0, 0, cw, ch);
+                const lsb = analyzeLSB(imageData);
+                // Compute heuristic suspicion score and decide alert
+                const fileSusp = tailInfo.suspiciousScore; // 0..100
+                const lsbSusp = lsb.combinedLSBscore; // 0..100
+                // Weighted combine
+                const combined = Math.min(100, Math.round(fileSusp * 0.6 + lsbSusp * 0.4));
+                // thresholds
+                const ALERT_THRESHOLD = 50;
+                const WARNING_THRESHOLD = 30;
+                let level = 'safe', css = 'green', msg = 'No obvious hidden data detected.';
+                if (combined >= ALERT_THRESHOLD) { level = 'alert'; css = 'red'; msg = 'ALERT: Suspicious hidden data likely present.'; }
+                else if (combined >= WARNING_THRESHOLD) { level = 'warn'; css = 'yellow'; msg = 'Warning: Some indicators present — further inspection recommended.'; }
+
+                // build report
+                const reportHTML = [];
+                reportHTML.push(`<div class="alert ${css}">${escapeHtml(msg)} <span class="small" style="margin-left:8px;">(score ${combined}/100)</span></div>`);
+                reportHTML.push(`<table><tr><th style="width:28%;">File</th><td class="small">${escapeHtml(f.name)} — ${f.size} bytes — magic: ${magic}</td></tr>`);
+                reportHTML.push(`<tr><th>Format guess</th><td class="small">${isJPG ? 'JPEG' : isPNG ? 'PNG' : isGIF
+                    
+                    ? 'GIF' : isBMP ? 'BMP' : 'Unknown'}</td></tr>`);
+                reportHTML.push(`<tr><th>Tail offset</th><td class="small">${tailOffset >= 0 ? `${tailOffset} bytes` : 'None detected'}</td></tr>`);
+                reportHTML.push(`<tr><th>Tail analysis</th><td class="small">${escapeHtml(tailInfo.summary)}</td></tr>`);
+                reportHTML.push(`<tr><th>LSB analysis</th><td class="small">${escapeHtml(lsb.summary)}</td></tr>`);
+                reportHTML.push(`</table>`);
+                reportEl.innerHTML = reportHTML.join('\n');
+                reportEl.style.display = 'block';
+            };
+        });
+
+        // Utility Functions
+
+        function readArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        function readDataURL(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.innerText = text;
+            return div.innerHTML;
+        }
+
+        function printableFraction(data) {
+            let count = 0;
+            for (let b of data) {
+                if (b >= 32 && b <= 126) count++;
+            }
+            return count / data.length;
+        }
+
+        function findFirstSignature(data, offset) {
+            const sigs = [
+                { name: 'ZIP', bytes: [0x50, 0x4B, 0x03, 0x04] },
+                { name: 'PDF', bytes: [0x25, 0x50, 0x44, 0x46] },
+                { name: 'RAR', bytes: [0x52, 0x61, 0x72, 0x21] },
+                { name: 'EXE', bytes: [0x4D, 0x5A] },
+                { name: 'PNG', bytes: [0x89, 0x50, 0x4E, 0x47] },
+                { name: 'JPG', bytes: [0xFF, 0xD8, 0xFF] },
+            ];
+            for (let i = offset; i < data.length - 8; i++) {
+                for (let sig of sigs) {
+                    let match = true;
+                    for (let j = 0; j < sig.bytes.length; j++) {
+                        if (data[i + j] !== sig.bytes[j]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) return { sig: sig.name, pos: i };
+                }
+            }
+            return null;
+        }
+
+        function analyzeTail(tail) {
+            if (tail.length === 0) return { suspiciousScore: 0, summary: "No extra data found." };
+
+            const printable = printableFraction(tail);
+            const sig = findFirstSignature(tail, 0);
+            const score = Math.min(100, Math.round((printable * 100) + (sig ? 30 : 0) + (tail.length > 512 ? 20 : 0)));
+            const summary = `Tail length: ${tail.length} bytes. Printable ratio: ${(printable * 100).toFixed(1)}%. ${sig ? `Found signature: ${sig.sig}.` : 'No known signature found.'}`;
+            return { suspiciousScore: score, summary };
+        }
+
+        function analyzeLSB(imageData) {
+            const data = imageData.data;
+            let lsbCount = [0, 0]; // 0 or 1 LSB values
+            for (let i = 0; i < data.length; i += 4) {
+                for (let j = 0; j < 3; j++) {
+                    const lsb = data[i + j] & 1;
+                    lsbCount[lsb]++;
+                }
+            }
+            const total = lsbCount[0] + lsbCount[1];
+            const balance = Math.abs(lsbCount[0] - lsbCount[1]) / total;
+            const score = Math.round((1 - balance) * 100); // higher score = more suspicious (more even = less natural)
+            const summary = `LSB 0s: ${lsbCount[0]}, 1s: ${lsbCount[1]}, balance: ${(1 - balance).toFixed(2)}.`;
+
+            return { combinedLSBscore: score, summary };
+        }
+    </script>
+</body>
+
+</html> -->
+
+<!-- <!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Steganography Scam Awareness | Image Checker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="style.css">
+  <script defer src="script.js"></script>
+</head>
+<body>
+  <nav>
+    <ul>
+      <li><a href="index.html">Home</a></li>
+      <li><a href="awareness.html">Awareness</a></li>
+      <li><a href="prevention.html">Prevention Tips</a></li>
+      <li><a href="about.html">About</a></li>
+    </ul>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h1>🕵️‍♂️ Hidden Data (Stego) Image Checker</h1>
+      <p>Upload an image to check if it may contain hidden or malicious data. This tool helps detect scams where images secretly carry harmful files (e.g., .apk, .zip).</p>
+
+      <input id="fileInput" type="file" accept="image/*" />
+      <div id="status"></div>
+      <div id="report" class="card" style="display:none;"></div>
+    </div>
+  </div>
+
+  <footer>
+    <p>&copy; 2025 Stego Awareness Project. | <a href="about.html">Contact Us</a></p>
+  </footer>
+</body>
+</html> -->
+
+
+
+<!-- mew after adding more content -->
+ <!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Steganography Scam Awareness | Image Checker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="style.css">
+  <script defer src="script.js"></script>
+</head>
+<body>
+  <nav>
+    <ul>
+      <li><a href="index.html">Home</a></li>
+      <li><a href="awareness.html">Awareness</a></li>
+      <li><a href="prevention.html">Prevention Tips</a></li>
+      <li><a href="about.html">About</a></li>
+    </ul>
+  </nav>
+
+  <div class="container">
+    <div class="card">
+      <h1>🕵️‍♂️ Hidden Data (Stego) Image Checker</h1>
+      <p>This tool helps you detect if an image might contain hidden or malicious data (like APKs or ZIP files). Upload an image below to check its safety.</p>
+
+      <input id="fileInput" type="file" accept="image/*" />
+      <div id="status"></div>
+      <div id="report" class="card" style="display:none;"></div>
+    </div>
+
+    <div class="card">
+      <h2>🧠 Did You Know?</h2>
+      <ul>
+        <li>Cybercriminals use <strong>steganography</strong> to hide viruses in innocent-looking photos.</li>
+        <li>Over <strong>75%</strong> of WhatsApp scams involve shared media files or links.</li>
+        <li>Malware hidden in images can steal passwords, contacts, and banking data.</li>
+      </ul>
+      <p>👉 Learn how these scams work on our <a href="awareness.html">Awareness Page</a>.</p>
+    </div>
+  </div>
+
+  <footer>
+    <p>&copy; 2025 Stego Awareness Project | <a href="about.html">Contact Us</a></p>
+  </footer>
+</body>
+</html>
